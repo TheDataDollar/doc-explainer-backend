@@ -11,19 +11,20 @@ from auth_deps import get_current_user
 from admin_auth import require_admin
 from auth_utils import hash_password, verify_password, create_access_token
 
-Base.metadata.create_all(bind=engine)
-
 app = FastAPI(title="Document Explainer API")
 
+# Create tables on startup (safer than running at import time)
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
 
 # ---------------- CORS (DEV SAFE) ----------------
-# This WILL fix your "Failed to fetch" issue
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # DEV ONLY (allows localhost, 127.0.0.1, etc)
+    allow_origins=["*"],          # DEV ONLY
     allow_credentials=False,      # must be False when origins = "*"
-    allow_methods=["*"],          # includes OPTIONS preflight
-    allow_headers=["*"],          # includes Authorization, Content-Type
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------- HEALTH ----------------
