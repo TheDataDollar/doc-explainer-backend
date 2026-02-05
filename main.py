@@ -5,15 +5,16 @@ from sqlalchemy.orm import Session
 import os
 import uuid
 
-from deps import get_db
-from models import User, Document
+from deps import get_db, engine
+from models import Base, User, Document
 from auth_deps import get_current_user
 from admin_auth import require_admin
 from auth_utils import hash_password, verify_password, create_access_token
 
-# ---------------- APP ----------------
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Document Explainer API")
+
 
 # ---------------- CORS (DEV SAFE) ----------------
 # This WILL fix your "Failed to fetch" issue
