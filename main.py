@@ -268,7 +268,7 @@ def upload_document(
 
     os.makedirs("storage", exist_ok=True)
 
-    ext = os.path.splitext(file.filename)[1]
+    ext = os.path.splitext(file.filename)[1] if file.filename else ""
     stored_filename = f"{uuid.uuid4().hex}{ext}"
     stored_path = os.path.join("storage", stored_filename)
 
@@ -277,9 +277,10 @@ def upload_document(
 
     doc = Document(
         user_id=current_user.id,
-        original_filename=file.filename,
+        original_filename=file.filename or "unknown",
         stored_filename=stored_filename,
         stored_path=stored_path,
+        status="uploaded",
     )
 
     db.add(doc)
@@ -291,6 +292,74 @@ def upload_document(
     db.refresh(doc)
 
     return {"document_id": doc.id}
+
+@app.get("/documents")
+def list_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    docs = (
+        db.query(Document)
+        .filter(Document.user_id == current_user.id)
+        .order_by(Document.id.desc())
+        .all()
+    )
+
+    return [
+        {
+            "document_id": d.id,
+            "original_filename": d.original_filename,
+            "stored_filename": d.stored_filename,
+            "created_at": d.created_at,
+            "status": d.status,
+        }
+        for d in docs
+    ]
+
+@app.get("/documents/{document_id}")
+def get_document(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    doc = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.user_id == current_user.id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "document_id": doc.id,
+        "original_filename": doc.original_filename,
+        "stored_filename": doc.stored_filename,
+        "stored_path": doc.stored_path,
+        "created_at": doc.created_at,
+        "status": doc.status,
+        "review_notes": doc.review_notes,
+    }
+
+@app.get("/documents/{document_id}/review")
+def get_document_review(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    doc = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.user_id == current_user.id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "document_id": doc.id,
+        "status": doc.status,
+        "review_notes": doc.review_notes,
+        "created_at": doc.created_at,
+    }
 
 # ---------------- ADMIN ----------------
 
