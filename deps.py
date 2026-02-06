@@ -1,15 +1,15 @@
 import os
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
+# Load .env (local dev)
+load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set. Add it in Render -> Environment.")
-
-# SQLAlchemy expects postgresql:// not postgres://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    raise RuntimeError("DATABASE_URL is not set. Add it in .env (local) or Render -> Environment.")
 
 engine = create_engine(
     DATABASE_URL,

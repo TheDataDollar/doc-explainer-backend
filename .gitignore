@@ -1,28 +1,35 @@
+# --------------------
 # Python
+# --------------------
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# --------------------
+# Databases / local state
+# --------------------
 *.sqlite3
 *.db
 
-# Virtual environments
+# --------------------
+# Environment variables / secrets
+# --------------------
+.env
+.env.*
 venv/
-.env/
 .venv/
 
-# OS / editor
+# --------------------
+# OS / Editor
+# --------------------
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 
-# Uploads (if you store files locally)
+# --------------------
+# Uploads / local storage
+# --------------------
 uploads/
 storage/
-
-venv/
-__pycache__/
-*.pyc
-.env
-
