@@ -10,6 +10,9 @@ import secrets
 from datetime import datetime, timedelta, timezone
 import requests
 
+# ✅ Stripe
+import stripe
+
 from deps import get_db, engine
 from models import Base, User, Document, PasswordResetToken
 from auth_deps import get_current_user
@@ -124,6 +127,30 @@ def send_reset_email(to_email: str, reset_link: str):
         print("⚠️ Resend request error:", str(e))
         print("🔑 PASSWORD RESET LINK:", reset_link)
 
+# ---------------- STRIPE (BILLING) ----------------
+# ENV VARS you must set on Render:
+# STRIPE_SECRET_KEY=sk_...
+# STRIPE_WEBHOOK_SECRET=whsec_...
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+# ✅ Your 4 allowed Stripe Price IDs (locked so nobody can spoof pricing)
+STARTER_MONTHLY_PRICE_ID = "price_1SyzVELBOsv1gBi7Bk9TagpX"
+STARTER_YEARLY_PRICE_ID  = "price_1SyzYoLBOsv1gBi7yvxY1GAv"
+PRO_MONTHLY_PRICE_ID     = "price_1SyzXKLBOsv1gBi7GOKQaIER"
+PRO_YEARLY_PRICE_ID      = "price_1SyzXKLBOsv1gBi7RhlNjAZ0"
+
+ALLOWED_PRICE_IDS = {
+    STARTER_MONTHLY_PRICE_ID,
+    STARTER_YEARLY_PRICE_ID,
+    PRO_MONTHLY_PRICE_ID,
+    PRO_YEARLY_PRICE_ID,
+}
+
 # ---------------- HEALTH ----------------
 
 @app.get("/health")
@@ -146,6 +173,10 @@ class ForgotPasswordBody(BaseModel):
 class ResetPasswordBody(BaseModel):
     token: str
     new_password: str
+
+# ✅ Billing request model
+class CheckoutBody(BaseModel):
+    price_id: str
 
 # ---------------- AUTH ----------------
 
@@ -254,6 +285,94 @@ def me(current_user: User = Depends(get_current_user)):
         "free_docs_used": current_user.free_docs_used,
         "is_paid": current_user.is_paid,
     }
+
+# ---------------- BILLING ----------------
+
+@app.post("/billing/checkout")
+def billing_checkout(
+    body: CheckoutBody,
+    current_user: User = Depends(get_current_user),
+):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    if body.price_id not in ALLOWED_PRICE_IDS:
+        raise HTTPException(status_code=400, detail="Invalid price")
+
+    success_url = f"{FRONTEND_URL}/billing/success"
+    cancel_url = f"{FRONTEND_URL}/billing/cancel"
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer_email=current_user.email,
+            line_items=[{"price": body.price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            subscription_data={
+                "metadata": {
+                    "user_id": str(current_user.id),
+                    "email": current_user.email,
+                }
+            },
+            metadata={
+                "user_id": str(current_user.id),
+                "email": current_user.email,
+            },
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/webhook")
+async def billing_webhook(request: Request, db: Session = Depends(get_db)):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Stripe webhook not configured")
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    event_type = event.get("type")
+    data_object = event.get("data", {}).get("object", {})
+
+    # ✅ When Stripe confirms a successful subscription payment
+    if event_type == "invoice.paid":
+        subscription_id = data_object.get("subscription")
+        if subscription_id:
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                user_id = (sub.get("metadata") or {}).get("user_id")
+                if user_id:
+                    user = db.query(User).filter(User.id == int(user_id)).first()
+                    if user and not user.is_paid:
+                        user.is_paid = True
+                        db.commit()
+            except Exception as e:
+                print("⚠️ webhook invoice.paid handling error:", str(e))
+
+    # ✅ If subscription is canceled/ended, revoke paid access
+    if event_type == "customer.subscription.deleted":
+        sub = data_object
+        user_id = (sub.get("metadata") or {}).get("user_id")
+        if user_id:
+            user = db.query(User).filter(User.id == int(user_id)).first()
+            if user and user.is_paid:
+                user.is_paid = False
+                db.commit()
+
+    return {"ok": True}
 
 # ---------------- DOCUMENTS ----------------
 
@@ -368,4 +487,6 @@ def admin_list_users(
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
+    # Keep your existing behavior for now (since it's working),
+    # but note: returning raw SQLAlchemy objects can break JSON serialization in some setups.
     return db.query(User).all()
