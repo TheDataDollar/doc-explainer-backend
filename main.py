@@ -1,3 +1,5 @@
+# main.py (FULL COPY / REPLACE)
+
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -143,7 +145,6 @@ STARTER_MONTHLY_PRICE_ID = "price_1Sz0cSLBOsv1gBi7yQoqTO0n"
 STARTER_YEARLY_PRICE_ID  = "price_1Sz0cTLBOsv1gBi7DKZyGbLy"
 PRO_MONTHLY_PRICE_ID     = "price_1Sz0dZLBOsv1gBi7fqenphoj"
 PRO_YEARLY_PRICE_ID      = "price_1Sz0dZLBOsv1gBi72C7VtbH8"
-
 
 ALLOWED_PRICE_IDS = {
     STARTER_MONTHLY_PRICE_ID,
@@ -346,32 +347,88 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     event_type = event.get("type")
-    data_object = event.get("data", {}).get("object", {})
+    obj = event.get("data", {}).get("object", {})
 
-    # ✅ When Stripe confirms a successful subscription payment
+    print("✅ Stripe webhook received:", event_type)
+
+    def set_paid_by_user_id(user_id: str | None, paid: bool) -> bool:
+        if not user_id:
+            return False
+        try:
+            user = db.query(User).filter(User.id == int(user_id)).first()
+            if not user:
+                return False
+            user.is_paid = paid
+            db.commit()
+            print(f"✅ Updated user_id={user.id} is_paid={paid}")
+            return True
+        except Exception as e:
+            print("⚠️ set_paid_by_user_id error:", str(e))
+            return False
+
+    def set_paid_by_email(email: str | None, paid: bool) -> bool:
+        if not email:
+            return False
+        try:
+            user = db.query(User).filter(User.email == email.lower().strip()).first()
+            if not user:
+                return False
+            user.is_paid = paid
+            db.commit()
+            print(f"✅ Updated email={user.email} is_paid={paid}")
+            return True
+        except Exception as e:
+            print("⚠️ set_paid_by_email error:", str(e))
+            return False
+
+    # ✅ invoice.paid -> grant access
     if event_type == "invoice.paid":
-        subscription_id = data_object.get("subscription")
+        subscription_id = obj.get("subscription")
+        customer_id = obj.get("customer")
+
+        user_id = None
+        email = None
+
+        # 1) Try subscription metadata.user_id
         if subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
                 user_id = (sub.get("metadata") or {}).get("user_id")
-                if user_id:
-                    user = db.query(User).filter(User.id == int(user_id)).first()
-                    if user and not user.is_paid:
-                        user.is_paid = True
-                        db.commit()
+                customer_id = customer_id or sub.get("customer")
+                print("ℹ️ invoice.paid subscription metadata user_id:", user_id)
             except Exception as e:
-                print("⚠️ webhook invoice.paid handling error:", str(e))
+                print("⚠️ Could not retrieve subscription:", str(e))
 
-    # ✅ If subscription is canceled/ended, revoke paid access
+        # 2) Fallback to customer email
+        if customer_id:
+            try:
+                cust = stripe.Customer.retrieve(customer_id)
+                email = cust.get("email")
+                print("ℹ️ invoice.paid customer email:", email)
+            except Exception as e:
+                print("⚠️ Could not retrieve customer:", str(e))
+
+        updated = set_paid_by_user_id(user_id, True)
+        if not updated:
+            set_paid_by_email(email, True)
+
+    # ✅ subscription deleted -> revoke access
     if event_type == "customer.subscription.deleted":
-        sub = data_object
+        sub = obj
         user_id = (sub.get("metadata") or {}).get("user_id")
-        if user_id:
-            user = db.query(User).filter(User.id == int(user_id)).first()
-            if user and user.is_paid:
-                user.is_paid = False
-                db.commit()
+        customer_id = sub.get("customer")
+
+        email = None
+        if customer_id:
+            try:
+                cust = stripe.Customer.retrieve(customer_id)
+                email = cust.get("email")
+            except Exception as e:
+                print("⚠️ Could not retrieve customer:", str(e))
+
+        updated = set_paid_by_user_id(user_id, False)
+        if not updated:
+            set_paid_by_email(email, False)
 
     return {"ok": True}
 
@@ -488,6 +545,4 @@ def admin_list_users(
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
-    # Keep your existing behavior for now (since it's working),
-    # but note: returning raw SQLAlchemy objects can break JSON serialization in some setups.
     return db.query(User).all()
