@@ -82,7 +82,6 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 def send_reset_email(to_email: str, reset_link: str):
-    # If Resend isn't configured, fall back to logs (dev-friendly)
     if not RESEND_API_KEY:
         print("🔑 PASSWORD RESET LINK:", reset_link)
         return
@@ -140,7 +139,7 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
-# ✅ Your 4 allowed Stripe Price IDs (locked so nobody can spoof pricing)
+# ✅ Your 4 allowed Stripe Price IDs
 STARTER_MONTHLY_PRICE_ID = "price_1Sz0cSLBOsv1gBi7yQoqTO0n"
 STARTER_YEARLY_PRICE_ID  = "price_1Sz0cTLBOsv1gBi7DKZyGbLy"
 PRO_MONTHLY_PRICE_ID     = "price_1Sz0dZLBOsv1gBi7fqenphoj"
@@ -176,7 +175,6 @@ class ResetPasswordBody(BaseModel):
     token: str
     new_password: str
 
-# ✅ Billing request model
 class CheckoutBody(BaseModel):
     price_id: str
 
@@ -230,7 +228,6 @@ def forgot_password(
     email = body.email.lower().strip()
     user = db.query(User).filter(User.email == email).first()
 
-    # Always return ok to prevent email enumeration
     if not user:
         return {"ok": True}
 
@@ -301,6 +298,7 @@ def billing_checkout(
     if body.price_id not in ALLOWED_PRICE_IDS:
         raise HTTPException(status_code=400, detail="Invalid price")
 
+    # ✅ These pages MUST exist on frontend
     success_url = f"{FRONTEND_URL}/billing/success"
     cancel_url = f"{FRONTEND_URL}/billing/cancel"
 
@@ -325,7 +323,6 @@ def billing_checkout(
         return {"url": session.url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/billing/webhook")
 async def billing_webhook(request: Request, db: Session = Depends(get_db)):
@@ -357,6 +354,7 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
         try:
             user = db.query(User).filter(User.id == int(user_id)).first()
             if not user:
+                print("⚠️ No user for user_id:", user_id)
                 return False
             user.is_paid = paid
             db.commit()
@@ -372,6 +370,7 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
         try:
             user = db.query(User).filter(User.email == email.lower().strip()).first()
             if not user:
+                print("⚠️ No user for email:", email)
                 return False
             user.is_paid = paid
             db.commit()
@@ -381,7 +380,37 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
             print("⚠️ set_paid_by_email error:", str(e))
             return False
 
-    # ✅ invoice.paid -> grant access
+    # ✅ BEST: mark paid as soon as checkout completes
+    if event_type == "checkout.session.completed":
+        session = obj
+        user_id = (session.get("metadata") or {}).get("user_id")
+        email = (session.get("metadata") or {}).get("email")
+        customer_id = session.get("customer")
+        subscription_id = session.get("subscription")
+
+        # Try subscription metadata if session metadata missing
+        if subscription_id and not user_id:
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                user_id = (sub.get("metadata") or {}).get("user_id")
+                print("ℹ️ session.completed subscription user_id:", user_id)
+            except Exception as e:
+                print("⚠️ Could not retrieve subscription:", str(e))
+
+        # Try customer email if email missing
+        if customer_id and not email:
+            try:
+                cust = stripe.Customer.retrieve(customer_id)
+                email = cust.get("email")
+                print("ℹ️ session.completed customer email:", email)
+            except Exception as e:
+                print("⚠️ Could not retrieve customer:", str(e))
+
+        updated = set_paid_by_user_id(user_id, True)
+        if not updated:
+            set_paid_by_email(email, True)
+
+    # ✅ Keep invoice.paid too
     if event_type == "invoice.paid":
         subscription_id = obj.get("subscription")
         customer_id = obj.get("customer")
@@ -389,17 +418,15 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
         user_id = None
         email = None
 
-        # 1) Try subscription metadata.user_id
         if subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
                 user_id = (sub.get("metadata") or {}).get("user_id")
                 customer_id = customer_id or sub.get("customer")
-                print("ℹ️ invoice.paid subscription metadata user_id:", user_id)
+                print("ℹ️ invoice.paid subscription user_id:", user_id)
             except Exception as e:
                 print("⚠️ Could not retrieve subscription:", str(e))
 
-        # 2) Fallback to customer email
         if customer_id:
             try:
                 cust = stripe.Customer.retrieve(customer_id)
@@ -412,7 +439,7 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
         if not updated:
             set_paid_by_email(email, True)
 
-    # ✅ subscription deleted -> revoke access
+    # ✅ revoke on cancel
     if event_type == "customer.subscription.deleted":
         sub = obj
         user_id = (sub.get("metadata") or {}).get("user_id")
