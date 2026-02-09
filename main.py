@@ -139,10 +139,11 @@ if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 # ✅ Your 4 allowed Stripe Price IDs (locked so nobody can spoof pricing)
-STARTER_MONTHLY_PRICE_ID = "price_1SyzVELBOsv1gBi7Bk9TagpX"
-STARTER_YEARLY_PRICE_ID  = "price_1SyzYoLBOsv1gBi7yvxY1GAv"
-PRO_MONTHLY_PRICE_ID     = "price_1SyzXKLBOsv1gBi7GOKQaIER"
-PRO_YEARLY_PRICE_ID      = "price_1SyzXKLBOsv1gBi7RhlNjAZ0"
+STARTER_MONTHLY_PRICE_ID = "price_1Sz0cSLBOsv1gBi7yQoqTO0n"
+STARTER_YEARLY_PRICE_ID  = "price_1Sz0cTLBOsv1gBi7DKZyGbLy"
+PRO_MONTHLY_PRICE_ID     = "price_1Sz0dZLBOsv1gBi7fqenphoj"
+PRO_YEARLY_PRICE_ID      = "price_1Sz0dZLBOsv1gBi72C7VtbH8"
+
 
 ALLOWED_PRICE_IDS = {
     STARTER_MONTHLY_PRICE_ID,
