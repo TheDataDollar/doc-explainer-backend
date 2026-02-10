@@ -19,7 +19,18 @@ from auth_deps import get_current_user
 from admin_auth import require_admin
 from auth_utils import hash_password, verify_password, create_access_token
 
+# ✅ CREATE APP FIRST
 app = FastAPI(title="Document Explainer API")
+
+# ✅ Affiliate portal router (must be AFTER app is created)
+# IMPORTANT: this assumes you created: routers/affiliate_auth.py
+from routers.affiliate_auth import router as affiliate_auth_router
+app.include_router(affiliate_auth_router)
+
+# ✅ Ensure affiliate model is imported so Base.metadata.create_all creates its table
+# IMPORTANT: this assumes you created: models_affiliate.py
+from models_affiliate import AffiliateAccount  # noqa: F401
+
 
 # ---------------- STARTUP ----------------
 
@@ -296,8 +307,6 @@ def reset_password(body: ResetPasswordBody, db: Session = Depends(get_db)):
 
 @app.get("/me")
 def me(current_user: User = Depends(get_current_user)):
-    # If your User model has plan_tier column, this will work.
-    # If not, tier will fall back to "free/pro" based on is_paid.
     tier = getattr(current_user, "plan_tier", None)
     if tier:
         tier = str(tier)
@@ -314,7 +323,6 @@ def me(current_user: User = Depends(get_current_user)):
 
 # ---------------- BILLING ----------------
 
-# ✅ NEW: Frontend pulls these (no more hardcoding in frontend)
 @app.get("/billing/prices")
 def billing_prices():
     return {
@@ -397,11 +405,9 @@ def billing_verify(
         paid_ok = True
 
     if paid_ok:
-        # Ensure paid
         if not current_user.is_paid:
             current_user.is_paid = True
 
-        # If your User model has plan_tier, save it
         if hasattr(current_user, "plan_tier"):
             try:
                 setattr(current_user, "plan_tier", tier)
@@ -411,7 +417,6 @@ def billing_verify(
         db.commit()
         db.refresh(current_user)
 
-    # Return latest tier (DB or computed)
     tier_out = getattr(current_user, "plan_tier", None) or tier
 
     return {"ok": True, "is_paid": current_user.is_paid, "plan_tier": tier_out}
