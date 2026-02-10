@@ -138,14 +138,12 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
-# ✅ Your 4 allowed Stripe Price IDs (locked so nobody can spoof pricing)
-# NOTE: In your frontend mapping:
-# - "pro" uses STARTER_* price ids => tier "starter"
-# - "business" uses PRO_* price ids => tier "business"
-STARTER_MONTHLY_PRICE_ID = "price_1Sz0cSLBOsv1gBi7yQoqTO0n"  # $47
-STARTER_YEARLY_PRICE_ID  = "price_1Sz0cTLBOsv1gBi7DKZyGbLy"  # yearly
-PRO_MONTHLY_PRICE_ID     = "price_1Sz0dZLBOsv1gBi7fqenphoj"  # $209
-PRO_YEARLY_PRICE_ID      = "price_1Sz0dZLBOsv1gBi72C7VtbH8"  # yearly
+# ✅ LIVE Stripe Price IDs (locked so nobody can spoof pricing)
+STARTER_MONTHLY_PRICE_ID = "price_1SyzVELBOsv1gBi7Bk9TagpX"
+STARTER_YEARLY_PRICE_ID  = "price_1SyzYoLBOsv1gBi7yvxY1GAv"
+
+PRO_MONTHLY_PRICE_ID     = "price_1SyzXKLBOsv1gBi7GOKQaIER"
+PRO_YEARLY_PRICE_ID      = "price_1SyzXKLBOsv1gBi7RhlNjAZ0"
 
 ALLOWED_PRICE_IDS = {
     STARTER_MONTHLY_PRICE_ID,
@@ -154,12 +152,32 @@ ALLOWED_PRICE_IDS = {
     PRO_YEARLY_PRICE_ID,
 }
 
-def price_to_tier(price_id: str) -> str:
-    if price_id in (STARTER_MONTHLY_PRICE_ID, STARTER_YEARLY_PRICE_ID):
-        return "starter"
+
+def plan_tier_from_price_id(price_id: str | None) -> str:
+    if not price_id:
+        return "free"
     if price_id in (PRO_MONTHLY_PRICE_ID, PRO_YEARLY_PRICE_ID):
         return "business"
+    if price_id in (STARTER_MONTHLY_PRICE_ID, STARTER_YEARLY_PRICE_ID):
+        return "pro"
     return "free"
+
+def get_or_create_stripe_customer(email: str, user_id: int):
+    """
+    Safe customer lookup by email (no DB field required).
+    """
+    try:
+        existing = stripe.Customer.list(email=email, limit=1)
+        if existing and existing.data:
+            return existing.data[0]
+    except Exception as e:
+        print("⚠️ stripe.Customer.list error:", str(e))
+
+    # create new
+    return stripe.Customer.create(
+        email=email,
+        metadata={"user_id": str(user_id)},
+    )
 
 # ---------------- HEALTH ----------------
 
@@ -184,6 +202,7 @@ class ResetPasswordBody(BaseModel):
     token: str
     new_password: str
 
+# ✅ Billing request model
 class CheckoutBody(BaseModel):
     price_id: str
 
@@ -201,7 +220,6 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
         password_hash=hash_password(body.password),
         free_docs_used=0,
         is_paid=False,
-        plan_tier="free",
     )
 
     db.add(user)
@@ -225,7 +243,6 @@ def login(body: LoginBody, db: Session = Depends(get_db)):
         "token": token,
         "free_docs_used": user.free_docs_used,
         "is_paid": user.is_paid,
-        "plan_tier": getattr(user, "plan_tier", "free"),
     }
 
 # ---------------- FORGOT / RESET PASSWORD ----------------
@@ -290,12 +307,18 @@ def reset_password(body: ResetPasswordBody, db: Session = Depends(get_db)):
 
 @app.get("/me")
 def me(current_user: User = Depends(get_current_user)):
+    # By default, free
+    tier = "free"
+    if current_user.is_paid:
+        # If paid but we don't know tier here, frontend will still treat as paid.
+        # Tier is best determined from Stripe verify/webhooks. We'll keep it here as "paid=pro".
+        tier = "pro"
     return {
         "user_id": current_user.id,
         "email": current_user.email,
         "free_docs_used": current_user.free_docs_used,
         "is_paid": current_user.is_paid,
-        "plan_tier": getattr(current_user, "plan_tier", "free"),
+        "plan_tier": tier,
     }
 
 # ---------------- BILLING ----------------
@@ -311,9 +334,7 @@ def billing_checkout(
     if body.price_id not in ALLOWED_PRICE_IDS:
         raise HTTPException(status_code=400, detail="Invalid price")
 
-    tier = price_to_tier(body.price_id)
-
-    # ✅ include CHECKOUT_SESSION_ID so frontend can verify
+    # ✅ include CHECKOUT_SESSION_ID for verify flow
     success_url = f"{FRONTEND_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{FRONTEND_URL}/billing/cancel"
 
@@ -328,13 +349,12 @@ def billing_checkout(
                 "metadata": {
                     "user_id": str(current_user.id),
                     "email": current_user.email,
-                    "plan_tier": tier,
+                    "price_id": body.price_id,
                 }
             },
             metadata={
                 "user_id": str(current_user.id),
                 "email": current_user.email,
-                "plan_tier": tier,
                 "price_id": body.price_id,
             },
         )
@@ -356,41 +376,45 @@ def billing_verify(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session: {str(e)}")
 
-    # Make sure session belongs to this user
-    meta = s.get("metadata") or {}
-    meta_user_id = meta.get("user_id")
+    meta_user_id = (s.get("metadata") or {}).get("user_id")
     if meta_user_id and str(current_user.id) != str(meta_user_id):
         raise HTTPException(status_code=403, detail="Session does not belong to user")
 
-    paid_ok = False
-    payment_status = s.get("payment_status")
-    if payment_status == "paid":
-        paid_ok = True
+    # Determine tier from session metadata price_id (set during checkout)
+    price_id = (s.get("metadata") or {}).get("price_id")
+    tier = plan_tier_from_price_id(price_id)
 
-    # subscription checkout sessions often show status="complete"
+    paid_ok = False
+    if s.get("payment_status") == "paid":
+        paid_ok = True
     if s.get("mode") == "subscription" and s.get("status") in ("complete", "completed"):
         paid_ok = True
 
-    # ✅ update tier if paid
-    plan_tier = meta.get("plan_tier") or "free"
+    if paid_ok and not current_user.is_paid:
+        current_user.is_paid = True
+        db.commit()
+        db.refresh(current_user)
 
-    if paid_ok:
-        changed = False
-        if not current_user.is_paid:
-            current_user.is_paid = True
-            changed = True
-        if getattr(current_user, "plan_tier", "free") != plan_tier:
-            current_user.plan_tier = plan_tier
-            changed = True
-        if changed:
-            db.commit()
-            db.refresh(current_user)
+    return {"ok": True, "is_paid": current_user.is_paid, "plan_tier": tier}
 
-    return {
-        "ok": True,
-        "is_paid": current_user.is_paid,
-        "plan_tier": getattr(current_user, "plan_tier", "free"),
-    }
+# ✅ NEW: Customer Portal
+@app.post("/billing/portal")
+def billing_portal(
+    current_user: User = Depends(get_current_user),
+):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        cust = get_or_create_stripe_customer(current_user.email, current_user.id)
+
+        portal = stripe.billing_portal.Session.create(
+            customer=cust.id,
+            return_url=f"{FRONTEND_URL}/dashboard",
+        )
+        return {"url": portal.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/billing/webhook")
 async def billing_webhook(request: Request, db: Session = Depends(get_db)):
@@ -416,62 +440,63 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
 
     print("✅ Stripe webhook received:", event_type)
 
-    def set_user_access(user: User, paid: bool, tier: str | None):
-        user.is_paid = paid
-        if not paid:
-            user.plan_tier = "free"
-        else:
-            if tier in ("starter", "business"):
-                user.plan_tier = tier
-        db.commit()
-        print(f"✅ Updated user_id={user.id} is_paid={user.is_paid} plan_tier={user.plan_tier}")
-
-    def find_user_by_id(user_id: str | None) -> User | None:
+    def set_paid_by_user_id(user_id: str | None, paid: bool) -> bool:
         if not user_id:
-            return None
+            return False
         try:
-            return db.query(User).filter(User.id == int(user_id)).first()
-        except Exception:
-            return None
+            user = db.query(User).filter(User.id == int(user_id)).first()
+            if not user:
+                return False
+            user.is_paid = paid
+            db.commit()
+            print(f"✅ Updated user_id={user.id} is_paid={paid}")
+            return True
+        except Exception as e:
+            print("⚠️ set_paid_by_user_id error:", str(e))
+            return False
 
-    def find_user_by_email(email: str | None) -> User | None:
+    def set_paid_by_email(email: str | None, paid: bool) -> bool:
         if not email:
-            return None
-        return db.query(User).filter(User.email == email.lower().strip()).first()
+            return False
+        try:
+            user = db.query(User).filter(User.email == email.lower().strip()).first()
+            if not user:
+                return False
+            user.is_paid = paid
+            db.commit()
+            print(f"✅ Updated email={user.email} is_paid={paid}")
+            return True
+        except Exception as e:
+            print("⚠️ set_paid_by_email error:", str(e))
+            return False
 
-    # ✅ checkout session completed -> grant access immediately + tier
+    # checkout completed -> grant access immediately
     if event_type == "checkout.session.completed":
         session = obj
-        meta = session.get("metadata") or {}
-        meta_user_id = meta.get("user_id")
-        meta_tier = meta.get("plan_tier")
-
+        meta_user_id = (session.get("metadata") or {}).get("user_id")
         customer_email = (
             (session.get("customer_details") or {}).get("email")
             or session.get("customer_email")
-            or meta.get("email")
         )
 
-        user = find_user_by_id(meta_user_id) or find_user_by_email(customer_email)
-        if user:
-            set_user_access(user, True, meta_tier)
+        updated = set_paid_by_user_id(meta_user_id, True)
+        if not updated:
+            set_paid_by_email(customer_email, True)
 
-    # ✅ invoice paid -> grant access (backup) + tier from subscription metadata
+    # invoice paid -> grant access (backup path)
     if event_type in ("invoice.paid", "invoice.payment_succeeded"):
         subscription_id = obj.get("subscription")
         customer_id = obj.get("customer")
 
         user_id = None
-        tier = None
         email = None
 
         if subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
-                smeta = sub.get("metadata") or {}
-                user_id = smeta.get("user_id")
-                tier = smeta.get("plan_tier")
+                user_id = (sub.get("metadata") or {}).get("user_id")
                 customer_id = customer_id or sub.get("customer")
+                print("ℹ️ invoice.* subscription metadata user_id:", user_id)
             except Exception as e:
                 print("⚠️ Could not retrieve subscription:", str(e))
 
@@ -479,18 +504,18 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
             try:
                 cust = stripe.Customer.retrieve(customer_id)
                 email = cust.get("email")
+                print("ℹ️ invoice.* customer email:", email)
             except Exception as e:
                 print("⚠️ Could not retrieve customer:", str(e))
 
-        user = find_user_by_id(user_id) or find_user_by_email(email)
-        if user:
-            set_user_access(user, True, tier)
+        updated = set_paid_by_user_id(user_id, True)
+        if not updated:
+            set_paid_by_email(email, True)
 
-    # ✅ subscription deleted -> revoke access
+    # subscription deleted -> revoke access
     if event_type == "customer.subscription.deleted":
         sub = obj
-        meta = sub.get("metadata") or {}
-        user_id = meta.get("user_id")
+        user_id = (sub.get("metadata") or {}).get("user_id")
         customer_id = sub.get("customer")
 
         email = None
@@ -501,9 +526,9 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
             except Exception as e:
                 print("⚠️ Could not retrieve customer:", str(e))
 
-        user = find_user_by_id(user_id) or find_user_by_email(email)
-        if user:
-            set_user_access(user, False, None)
+        updated = set_paid_by_user_id(user_id, False)
+        if not updated:
+            set_paid_by_email(email, False)
 
     return {"ok": True}
 
