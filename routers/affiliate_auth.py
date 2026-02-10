@@ -6,27 +6,25 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-import jwt
+from jose import jwt, JWTError
 
 from deps import get_db
 from auth_utils import hash_password, verify_password
-
 from models_affiliate import AffiliateAccount
 
 router = APIRouter(prefix="/affiliate/auth", tags=["Affiliate Auth"])
 
 
+# ---------------- JWT HELPERS ----------------
+
 def _jwt_secret() -> str:
-    # Try common env var names
     secret = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").strip()
     if not secret:
-        # If this happens, set JWT_SECRET in Render env vars
-        raise RuntimeError("Missing JWT secret. Set JWT_SECRET (or SECRET_KEY).")
+        raise RuntimeError("Missing JWT_SECRET environment variable")
     return secret
 
 
 def _make_ref_code() -> str:
-    # Short readable code, uppercase
     return secrets.token_hex(4).upper()  # 8 chars
 
 
@@ -45,15 +43,16 @@ def _decode_affiliate_token(token: str) -> int:
     try:
         payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
         if payload.get("role") != "affiliate":
-            raise Exception("bad role")
+            raise JWTError("Invalid role")
         sub = payload.get("sub") or ""
         if not sub.startswith("affiliate:"):
-            raise Exception("bad sub")
-        affiliate_id = int(sub.split(":", 1)[1])
-        return affiliate_id
-    except Exception:
+            raise JWTError("Invalid subject")
+        return int(sub.split(":", 1)[1])
+    except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
+# ---------------- SCHEMAS ----------------
 
 class AffiliateRegisterIn(BaseModel):
     email: EmailStr
@@ -66,12 +65,13 @@ class AffiliateLoginIn(BaseModel):
     password: str
 
 
+# ---------------- ROUTES ----------------
+
 @router.post("/register")
 def register_affiliate(payload: AffiliateRegisterIn, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
 
-    existing = db.query(AffiliateAccount).filter(AffiliateAccount.email == email).first()
-    if existing:
+    if db.query(AffiliateAccount).filter(AffiliateAccount.email == email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
 
     ref_code = _make_ref_code()
