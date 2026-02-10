@@ -18,6 +18,9 @@ from db import Base, User, Document, PasswordResetToken
 
 # IMPORTANT: import affiliate model so table is created
 from models_affiliate import AffiliateAccount  # noqa: F401
+from routers.affiliate_admin import router as affiliate_admin_router
+app.include_router(affiliate_admin_router)
+
 
 # ---------------- AUTH ----------------
 
