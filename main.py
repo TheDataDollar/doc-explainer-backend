@@ -8,8 +8,7 @@ from sqlalchemy.exc import OperationalError
 import os
 import uuid
 import hashlib
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import requests
 import stripe
 
@@ -32,7 +31,7 @@ from auth_utils import hash_password, verify_password, create_access_token
 app = FastAPI(title="Document Explainer API")
 
 # ---------------- ROUTERS ----------------
-# ✅ Routers must be included AFTER app is created
+# ✅ include routers AFTER app exists
 
 from routers.affiliate_auth import router as affiliate_auth_router
 from routers.affiliate_admin import router as affiliate_admin_router
@@ -92,7 +91,6 @@ def send_reset_email(to_email: str, reset_link: str):
         print("🔑 RESET LINK:", reset_link)
         return
 
-    # Best-effort (don't crash app if email fails)
     try:
         requests.post(
             "https://api.resend.com/emails",
@@ -114,8 +112,8 @@ def send_reset_email(to_email: str, reset_link: str):
 
 # ---------------- STRIPE ----------------
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -135,13 +133,6 @@ class RegisterBody(BaseModel):
 class LoginBody(BaseModel):
     email: EmailStr
     password: str
-
-class ForgotPasswordBody(BaseModel):
-    email: EmailStr
-
-class ResetPasswordBody(BaseModel):
-    token: str
-    new_password: str
 
 # ---------------- AUTH ROUTES ----------------
 
@@ -167,7 +158,8 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
 
 @app.post("/auth/login")
 def login(body: LoginBody, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == body.email.lower().strip()).first()
+    email = body.email.lower().strip()
+    user = db.query(User).filter(User.email == email).first()
 
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")

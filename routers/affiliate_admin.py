@@ -1,6 +1,6 @@
-# routers/affiliate_admin.py
+# routers/affiliate_admin.py (FULL COPY / REPLACE)
 
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
@@ -18,12 +18,16 @@ class ApproveAffiliateBody(BaseModel):
     commission_rate: Optional[float] = 0.30
 
 
+class RejectAffiliateBody(BaseModel):
+    email: EmailStr
+
+
 @router.get("/pending")
 def list_pending_affiliates(
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
-    rows = (
+    rows: List[AffiliateAccount] = (
         db.query(AffiliateAccount)
         .filter(AffiliateAccount.status == "pending")
         .order_by(AffiliateAccount.id.desc())
@@ -58,7 +62,10 @@ def approve_affiliate(
 
     rate = float(body.commission_rate or 0.30)
     if rate <= 0 or rate > 1:
-        raise HTTPException(status_code=400, detail="commission_rate must be between 0 and 1")
+        raise HTTPException(
+            status_code=400,
+            detail="commission_rate must be between 0 and 1",
+        )
 
     acc.status = "approved"
     acc.commission_rate = rate
@@ -68,6 +75,7 @@ def approve_affiliate(
 
     return {
         "ok": True,
+        "id": acc.id,
         "email": acc.email,
         "status": acc.status,
         "commission_rate": acc.commission_rate,
@@ -77,16 +85,18 @@ def approve_affiliate(
 
 @router.post("/reject")
 def reject_affiliate(
-    email: EmailStr,
+    body: RejectAffiliateBody,
     db: Session = Depends(get_db),
     _admin=Depends(require_admin),
 ):
-    e = email.lower().strip()
-    acc = db.query(AffiliateAccount).filter(AffiliateAccount.email == e).first()
+    email = body.email.lower().strip()
+
+    acc = db.query(AffiliateAccount).filter(AffiliateAccount.email == email).first()
     if not acc:
         raise HTTPException(status_code=404, detail="Affiliate not found")
 
     acc.status = "rejected"
     db.commit()
+    db.refresh(acc)
 
-    return {"ok": True, "email": acc.email, "status": acc.status}
+    return {"ok": True, "id": acc.id, "email": acc.email, "status": acc.status}
