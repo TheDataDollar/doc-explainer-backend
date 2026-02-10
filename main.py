@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request, BackgroundTasks
+# main.py (FULL COPY / REPLACE)
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -18,9 +20,6 @@ from db import Base, User, Document, PasswordResetToken
 
 # IMPORTANT: import affiliate model so table is created
 from models_affiliate import AffiliateAccount  # noqa: F401
-from routers.affiliate_admin import router as affiliate_admin_router
-app.include_router(affiliate_admin_router)
-
 
 # ---------------- AUTH ----------------
 
@@ -33,9 +32,13 @@ from auth_utils import hash_password, verify_password, create_access_token
 app = FastAPI(title="Document Explainer API")
 
 # ---------------- ROUTERS ----------------
+# ✅ Routers must be included AFTER app is created
 
 from routers.affiliate_auth import router as affiliate_auth_router
+from routers.affiliate_admin import router as affiliate_admin_router
+
 app.include_router(affiliate_auth_router)
+app.include_router(affiliate_admin_router)
 
 # ---------------- STARTUP ----------------
 
@@ -89,20 +92,25 @@ def send_reset_email(to_email: str, reset_link: str):
         print("🔑 RESET LINK:", reset_link)
         return
 
-    requests.post(
-        "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "from": FROM_EMAIL,
-            "to": [to_email],
-            "subject": "Reset your password",
-            "html": f"<a href='{reset_link}'>Reset password</a>",
-        },
-        timeout=10,
-    )
+    # Best-effort (don't crash app if email fails)
+    try:
+        requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": FROM_EMAIL,
+                "to": [to_email],
+                "subject": "Reset your password",
+                "html": f"<a href='{reset_link}'>Reset password</a>",
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print("⚠️ Resend failed:", str(e))
+        print("🔑 RESET LINK:", reset_link)
 
 # ---------------- STRIPE ----------------
 
@@ -159,7 +167,7 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
 
 @app.post("/auth/login")
 def login(body: LoginBody, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == body.email.lower()).first()
+    user = db.query(User).filter(User.email == body.email.lower().strip()).first()
 
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -196,7 +204,8 @@ def upload_document(
 
     os.makedirs("storage", exist_ok=True)
 
-    stored_filename = f"{uuid.uuid4().hex}{os.path.splitext(file.filename)[1]}"
+    ext = os.path.splitext(file.filename or "")[1]
+    stored_filename = f"{uuid.uuid4().hex}{ext}"
     stored_path = os.path.join("storage", stored_filename)
 
     with open(stored_path, "wb") as f:
@@ -204,7 +213,7 @@ def upload_document(
 
     doc = Document(
         user_id=current_user.id,
-        original_filename=file.filename,
+        original_filename=file.filename or "unknown",
         stored_filename=stored_filename,
         stored_path=stored_path,
     )
