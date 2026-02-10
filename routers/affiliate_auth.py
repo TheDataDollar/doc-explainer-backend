@@ -1,3 +1,5 @@
+# routers/affiliate_auth.py
+
 import os
 import secrets
 import time
@@ -9,44 +11,34 @@ from sqlalchemy.orm import Session
 from jose import jwt, JWTError
 
 from deps import get_db
-from auth_utils import hash_password, verify_password
+from db import Base  # ✅ Base comes from db
 from models_affiliate import AffiliateAccount
+from auth_utils import hash_password, verify_password
 
 router = APIRouter(prefix="/affiliate/auth", tags=["Affiliate Auth"])
 
 
 # ---------------- JWT HELPERS ----------------
 
-def _jwt_secret() -> str:
-    secret = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").strip()
-    if not secret:
-        raise RuntimeError("Missing JWT_SECRET environment variable")
-    return secret
+JWT_SECRET = (os.getenv("JWT_SECRET") or "change_me_super_long").strip()
+JWT_ALG = "HS256"
 
 
-def _make_ref_code() -> str:
-    return secrets.token_hex(4).upper()  # 8 chars
-
-
-def _create_affiliate_token(affiliate_id: int) -> str:
-    now = int(time.time())
+def create_affiliate_token(affiliate_id: int) -> str:
     payload = {
         "sub": f"affiliate:{affiliate_id}",
-        "role": "affiliate",
-        "iat": now,
-        "exp": now + 60 * 60 * 24 * 7,  # 7 days
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 60 * 60 * 24 * 7,  # 7 days
     }
-    return jwt.encode(payload, _jwt_secret(), algorithm="HS256")
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 
-def _decode_affiliate_token(token: str) -> int:
+def decode_affiliate_token(token: str) -> int:
     try:
-        payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
-        if payload.get("role") != "affiliate":
-            raise JWTError("Invalid role")
-        sub = payload.get("sub") or ""
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        sub = payload.get("sub", "")
         if not sub.startswith("affiliate:"):
-            raise JWTError("Invalid subject")
+            raise JWTError()
         return int(sub.split(":", 1)[1])
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -74,9 +66,7 @@ def register_affiliate(payload: AffiliateRegisterIn, db: Session = Depends(get_d
     if db.query(AffiliateAccount).filter(AffiliateAccount.email == email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    ref_code = _make_ref_code()
-    while db.query(AffiliateAccount).filter(AffiliateAccount.ref_code == ref_code).first():
-        ref_code = _make_ref_code()
+    ref_code = secrets.token_hex(4).upper()
 
     acc = AffiliateAccount(
         email=email,
@@ -94,22 +84,25 @@ def register_affiliate(payload: AffiliateRegisterIn, db: Session = Depends(get_d
     return {
         "ok": True,
         "status": acc.status,
-        "message": "Application received. Pending approval.",
+        "message": "Affiliate application submitted",
     }
 
 
 @router.post("/login")
 def login_affiliate(payload: AffiliateLoginIn, db: Session = Depends(get_db)):
-    email = payload.email.lower().strip()
+    acc = (
+        db.query(AffiliateAccount)
+        .filter(AffiliateAccount.email == payload.email.lower().strip())
+        .first()
+    )
 
-    acc = db.query(AffiliateAccount).filter(AffiliateAccount.email == email).first()
     if not acc or not verify_password(payload.password, acc.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if acc.status != "approved":
-        raise HTTPException(status_code=403, detail="Not approved yet")
+        raise HTTPException(status_code=403, detail="Affiliate not approved")
 
-    token = _create_affiliate_token(acc.id)
+    token = create_affiliate_token(acc.id)
     return {"access_token": token, "token_type": "bearer"}
 
 
@@ -121,8 +114,8 @@ def affiliate_me(
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
 
-    token = authorization.split(" ", 1)[1].strip()
-    affiliate_id = _decode_affiliate_token(token)
+    token = authorization.split(" ", 1)[1]
+    affiliate_id = decode_affiliate_token(token)
 
     acc = db.query(AffiliateAccount).filter(AffiliateAccount.id == affiliate_id).first()
     if not acc:
