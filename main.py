@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
-from sqlalchemy import text
 import os
 import uuid
 import hashlib
@@ -11,6 +10,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 import requests
 
+# ✅ Stripe
 import stripe
 
 from deps import get_db, engine
@@ -23,26 +23,16 @@ app = FastAPI(title="Document Explainer API")
 
 # ---------------- STARTUP ----------------
 
-def _ensure_user_plan_tier_column():
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_tier VARCHAR DEFAULT 'free'"))
-            conn.execute(text("UPDATE users SET plan_tier='free' WHERE plan_tier IS NULL"))
-    except Exception as e:
-        print("⚠️ Could not ensure plan_tier column:", str(e))
-
 @app.on_event("startup")
 def on_startup():
     try:
         Base.metadata.create_all(bind=engine)
         print("✅ DB tables ensured")
-        _ensure_user_plan_tier_column()
-        print("✅ plan_tier ensured")
     except OperationalError as e:
         print("⚠️ DB not reachable on startup (local dev). App will still run.")
         print(e)
 
-# ---------------- CORS ----------------
+# ---------------- CORS (LOCKED DOWN) ----------------
 
 ENV = os.getenv("ENV", "development").lower()
 
@@ -67,7 +57,13 @@ app.add_middleware(
     allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+    ],
 )
 
 # ---------------- HELPERS ----------------
@@ -84,6 +80,7 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 def send_reset_email(to_email: str, reset_link: str):
+    # If Resend isn't configured, fall back to logs (dev-friendly)
     if not RESEND_API_KEY:
         print("🔑 PASSWORD RESET LINK:", reset_link)
         return
@@ -98,16 +95,29 @@ def send_reset_email(to_email: str, reset_link: str):
           Reset password
         </a>
       </p>
-      <p style="color:#6b7280;font-size:12px;">If you didn’t request this, you can ignore this email.</p>
-      <p style="color:#6b7280;font-size:12px;">Or copy/paste this link:<br/><span>{reset_link}</span></p>
+      <p style="color:#6b7280;font-size:12px;">
+        If you didn’t request this, you can ignore this email.
+      </p>
+      <p style="color:#6b7280;font-size:12px;">
+        Or copy/paste this link:<br/>
+        <span>{reset_link}</span>
+      </p>
     </div>
     """
 
     try:
         r = requests.post(
             "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={"from": FROM_EMAIL, "to": [to_email], "subject": subject, "html": html},
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html,
+            },
             timeout=10,
         )
         if r.status_code >= 300:
@@ -117,7 +127,10 @@ def send_reset_email(to_email: str, reset_link: str):
         print("⚠️ Resend request error:", str(e))
         print("🔑 PASSWORD RESET LINK:", reset_link)
 
-# ---------------- STRIPE ----------------
+# ---------------- STRIPE (BILLING) ----------------
+# ENV VARS you must set on Render:
+# STRIPE_SECRET_KEY=sk_...
+# STRIPE_WEBHOOK_SECRET=whsec_...
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -125,69 +138,28 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
-PRO_MONTHLY_PRICE_ID      = "price_1Sz0cSLBOsv1gBi7yQoqTO0n"
-PRO_YEARLY_PRICE_ID       = "price_1Sz0cTLBOsv1gBi7DKZyGbLy"
-BUSINESS_MONTHLY_PRICE_ID = "price_1Sz0dZLBOsv1gBi7fqenphoj"
-BUSINESS_YEARLY_PRICE_ID  = "price_1Sz0dZLBOsv1gBi72C7VtbH8"
+# ✅ Your 4 allowed Stripe Price IDs (locked so nobody can spoof pricing)
+# NOTE: In your frontend mapping:
+# - "pro" uses STARTER_* price ids => tier "starter"
+# - "business" uses PRO_* price ids => tier "business"
+STARTER_MONTHLY_PRICE_ID = "price_1Sz0cSLBOsv1gBi7yQoqTO0n"  # $47
+STARTER_YEARLY_PRICE_ID  = "price_1Sz0cTLBOsv1gBi7DKZyGbLy"  # yearly
+PRO_MONTHLY_PRICE_ID     = "price_1Sz0dZLBOsv1gBi7fqenphoj"  # $209
+PRO_YEARLY_PRICE_ID      = "price_1Sz0dZLBOsv1gBi72C7VtbH8"  # yearly
 
 ALLOWED_PRICE_IDS = {
+    STARTER_MONTHLY_PRICE_ID,
+    STARTER_YEARLY_PRICE_ID,
     PRO_MONTHLY_PRICE_ID,
     PRO_YEARLY_PRICE_ID,
-    BUSINESS_MONTHLY_PRICE_ID,
-    BUSINESS_YEARLY_PRICE_ID,
 }
 
-def tier_from_price_id(price_id: str | None) -> str:
-    if not price_id:
-        return "free"
-    if price_id in (BUSINESS_MONTHLY_PRICE_ID, BUSINESS_YEARLY_PRICE_ID):
-        return "business"
+def price_to_tier(price_id: str) -> str:
+    if price_id in (STARTER_MONTHLY_PRICE_ID, STARTER_YEARLY_PRICE_ID):
+        return "starter"
     if price_id in (PRO_MONTHLY_PRICE_ID, PRO_YEARLY_PRICE_ID):
-        return "pro"
+        return "business"
     return "free"
-
-def set_user_paid_and_tier(user: User, paid: bool, tier: str | None):
-    user.is_paid = paid
-    if paid:
-        user.plan_tier = tier if tier in ("pro", "business") else "pro"
-    else:
-        user.plan_tier = "free"
-
-def sync_user_tier_from_stripe_email(email: str) -> tuple[bool, str]:
-    """
-    Returns (paid, tier) based on Stripe active subscription for this email.
-    """
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="Stripe not configured")
-
-    # Find customer by email
-    customers = stripe.Customer.list(email=email, limit=10)
-    custs = customers.get("data") or []
-    if not custs:
-        return (False, "free")
-
-    # Pick the newest customer
-    custs.sort(key=lambda c: c.get("created", 0), reverse=True)
-    customer_id = custs[0]["id"]
-
-    # Find active subscription
-    subs = stripe.Subscription.list(customer=customer_id, status="active", limit=10)
-    data = subs.get("data") or []
-    if not data:
-        return (False, "free")
-
-    # Pick newest active sub
-    data.sort(key=lambda s: s.get("created", 0), reverse=True)
-    sub = data[0]
-
-    # Get first price on subscription items
-    items = (sub.get("items") or {}).get("data") or []
-    price_id = None
-    if items:
-        price_id = ((items[0].get("price") or {}).get("id"))
-
-    tier = tier_from_price_id(price_id)
-    return (True, tier)
 
 # ---------------- HEALTH ----------------
 
@@ -267,6 +239,7 @@ def forgot_password(
     email = body.email.lower().strip()
     user = db.query(User).filter(User.email == email).first()
 
+    # Always return ok to prevent email enumeration
     if not user:
         return {"ok": True}
 
@@ -338,10 +311,11 @@ def billing_checkout(
     if body.price_id not in ALLOWED_PRICE_IDS:
         raise HTTPException(status_code=400, detail="Invalid price")
 
+    tier = price_to_tier(body.price_id)
+
+    # ✅ include CHECKOUT_SESSION_ID so frontend can verify
     success_url = f"{FRONTEND_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{FRONTEND_URL}/billing/cancel"
-
-    tier = tier_from_price_id(body.price_id)
 
     try:
         session = stripe.checkout.Session.create(
@@ -355,7 +329,6 @@ def billing_checkout(
                     "user_id": str(current_user.id),
                     "email": current_user.email,
                     "plan_tier": tier,
-                    "price_id": body.price_id,
                 }
             },
             metadata={
@@ -383,55 +356,41 @@ def billing_verify(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session: {str(e)}")
 
+    # Make sure session belongs to this user
     meta = s.get("metadata") or {}
     meta_user_id = meta.get("user_id")
-
     if meta_user_id and str(current_user.id) != str(meta_user_id):
         raise HTTPException(status_code=403, detail="Session does not belong to user")
 
-    # If verify says paid, set paid+tier
+    paid_ok = False
     payment_status = s.get("payment_status")
-    status = s.get("status")
-    mode = s.get("mode")
+    if payment_status == "paid":
+        paid_ok = True
 
-    paid_ok = (payment_status == "paid") or (mode == "subscription" and status in ("complete", "completed"))
+    # subscription checkout sessions often show status="complete"
+    if s.get("mode") == "subscription" and s.get("status") in ("complete", "completed"):
+        paid_ok = True
+
+    # ✅ update tier if paid
+    plan_tier = meta.get("plan_tier") or "free"
 
     if paid_ok:
-        # Determine tier reliably
-        tier = meta.get("plan_tier") or tier_from_price_id(meta.get("price_id"))
+        changed = False
+        if not current_user.is_paid:
+            current_user.is_paid = True
+            changed = True
+        if getattr(current_user, "plan_tier", "free") != plan_tier:
+            current_user.plan_tier = plan_tier
+            changed = True
+        if changed:
+            db.commit()
+            db.refresh(current_user)
 
-        # If still unknown, fallback to Stripe email lookup
-        if tier == "free":
-            paid2, tier2 = sync_user_tier_from_stripe_email(current_user.email)
-            if paid2:
-                tier = tier2
-
-        set_user_paid_and_tier(current_user, True, tier)
-        db.commit()
-        db.refresh(current_user)
-
-    return {"ok": True, "is_paid": current_user.is_paid, "plan_tier": getattr(current_user, "plan_tier", "free")}
-
-@app.get("/billing/sync")
-def billing_sync(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    ✅ FIXES YOUR EXACT PROBLEM:
-    If you're already paid but plan_tier stayed "free", this will sync from Stripe.
-    """
-    paid, tier = sync_user_tier_from_stripe_email(current_user.email)
-
-    if not paid:
-        set_user_paid_and_tier(current_user, False, None)
-    else:
-        set_user_paid_and_tier(current_user, True, tier)
-
-    db.commit()
-    db.refresh(current_user)
-
-    return {"ok": True, "is_paid": current_user.is_paid, "plan_tier": current_user.plan_tier}
+    return {
+        "ok": True,
+        "is_paid": current_user.is_paid,
+        "plan_tier": getattr(current_user, "plan_tier", "free"),
+    }
 
 @app.post("/billing/webhook")
 async def billing_webhook(request: Request, db: Session = Depends(get_db)):
@@ -442,7 +401,11 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
     sig_header = request.headers.get("stripe-signature")
 
     try:
-        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid payload")
     except stripe.error.SignatureVerificationError:
@@ -450,41 +413,53 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
 
     event_type = event.get("type")
     obj = event.get("data", {}).get("object", {})
+
     print("✅ Stripe webhook received:", event_type)
 
-    def set_by_user_id(user_id: str | None, paid: bool, tier: str | None) -> bool:
+    def set_user_access(user: User, paid: bool, tier: str | None):
+        user.is_paid = paid
+        if not paid:
+            user.plan_tier = "free"
+        else:
+            if tier in ("starter", "business"):
+                user.plan_tier = tier
+        db.commit()
+        print(f"✅ Updated user_id={user.id} is_paid={user.is_paid} plan_tier={user.plan_tier}")
+
+    def find_user_by_id(user_id: str | None) -> User | None:
         if not user_id:
-            return False
-        user = db.query(User).filter(User.id == int(user_id)).first()
-        if not user:
-            return False
-        set_user_paid_and_tier(user, paid, tier)
-        db.commit()
-        return True
+            return None
+        try:
+            return db.query(User).filter(User.id == int(user_id)).first()
+        except Exception:
+            return None
 
-    def set_by_email(email: str | None, paid: bool, tier: str | None) -> bool:
+    def find_user_by_email(email: str | None) -> User | None:
         if not email:
-            return False
-        user = db.query(User).filter(User.email == email.lower().strip()).first()
-        if not user:
-            return False
-        set_user_paid_and_tier(user, paid, tier)
-        db.commit()
-        return True
+            return None
+        return db.query(User).filter(User.email == email.lower().strip()).first()
 
+    # ✅ checkout session completed -> grant access immediately + tier
     if event_type == "checkout.session.completed":
-        meta = (obj.get("metadata") or {})
-        user_id = meta.get("user_id")
-        tier = meta.get("plan_tier") or tier_from_price_id(meta.get("price_id"))
-        email = (obj.get("customer_details") or {}).get("email") or obj.get("customer_email") or meta.get("email")
+        session = obj
+        meta = session.get("metadata") or {}
+        meta_user_id = meta.get("user_id")
+        meta_tier = meta.get("plan_tier")
 
-        if not set_by_user_id(user_id, True, tier):
-            set_by_email(email, True, tier)
+        customer_email = (
+            (session.get("customer_details") or {}).get("email")
+            or session.get("customer_email")
+            or meta.get("email")
+        )
 
+        user = find_user_by_id(meta_user_id) or find_user_by_email(customer_email)
+        if user:
+            set_user_access(user, True, meta_tier)
+
+    # ✅ invoice paid -> grant access (backup) + tier from subscription metadata
     if event_type in ("invoice.paid", "invoice.payment_succeeded"):
-        invoice = obj
-        subscription_id = invoice.get("subscription")
-        customer_id = invoice.get("customer")
+        subscription_id = obj.get("subscription")
+        customer_id = obj.get("customer")
 
         user_id = None
         tier = None
@@ -495,24 +470,28 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
                 sub = stripe.Subscription.retrieve(subscription_id)
                 smeta = sub.get("metadata") or {}
                 user_id = smeta.get("user_id")
-                tier = smeta.get("plan_tier") or tier_from_price_id(smeta.get("price_id"))
+                tier = smeta.get("plan_tier")
+                customer_id = customer_id or sub.get("customer")
             except Exception as e:
-                print("⚠️ Subscription retrieve failed:", str(e))
+                print("⚠️ Could not retrieve subscription:", str(e))
 
         if customer_id:
             try:
                 cust = stripe.Customer.retrieve(customer_id)
                 email = cust.get("email")
             except Exception as e:
-                print("⚠️ Customer retrieve failed:", str(e))
+                print("⚠️ Could not retrieve customer:", str(e))
 
-        if not set_by_user_id(user_id, True, tier):
-            set_by_email(email, True, tier)
+        user = find_user_by_id(user_id) or find_user_by_email(email)
+        if user:
+            set_user_access(user, True, tier)
 
+    # ✅ subscription deleted -> revoke access
     if event_type == "customer.subscription.deleted":
-        meta = (obj.get("metadata") or {})
+        sub = obj
+        meta = sub.get("metadata") or {}
         user_id = meta.get("user_id")
-        customer_id = obj.get("customer")
+        customer_id = sub.get("customer")
 
         email = None
         if customer_id:
@@ -520,10 +499,11 @@ async def billing_webhook(request: Request, db: Session = Depends(get_db)):
                 cust = stripe.Customer.retrieve(customer_id)
                 email = cust.get("email")
             except Exception as e:
-                print("⚠️ Customer retrieve failed:", str(e))
+                print("⚠️ Could not retrieve customer:", str(e))
 
-        if not set_by_user_id(user_id, False, None):
-            set_by_email(email, False, None)
+        user = find_user_by_id(user_id) or find_user_by_email(email)
+        if user:
+            set_user_access(user, False, None)
 
     return {"ok": True}
 
