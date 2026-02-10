@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta
-from jose import jwt
+from jose import jwt, JWTError
 from passlib.context import CryptContext
+import os
 
-# For MVP only. Later move these to .env
-JWT_SECRET = "change_me_super_long"
+# ✅ Use env if present (Render), fallback for local dev
+JWT_SECRET = (os.getenv("JWT_SECRET") or "change_me_super_long").strip()
 JWT_ALG = "HS256"
 ACCESS_TOKEN_MINUTES = 60 * 24 * 7  # 7 days
 
@@ -14,7 +15,6 @@ pwd_context = CryptContext(
 )
 
 def hash_password(password: str) -> str:
-    # simple safety: strip accidental spaces
     return pwd_context.hash(password.strip())
 
 def verify_password(password: str, password_hash: str) -> bool:
@@ -24,3 +24,13 @@ def create_access_token(user_id: int) -> str:
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_MINUTES)
     payload = {"sub": str(user_id), "exp": expire}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+def decode_access_token(token: str) -> int:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        sub = payload.get("sub")
+        if not sub:
+            raise ValueError("Missing sub")
+        return int(sub)
+    except (JWTError, ValueError):
+        raise ValueError("Invalid token")
