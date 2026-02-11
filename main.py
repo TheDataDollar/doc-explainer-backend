@@ -1,5 +1,3 @@
-# main.py (FULL COPY / REPLACE)
-
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -12,9 +10,9 @@ from datetime import datetime, timezone
 import requests
 import stripe
 
-# ✅ AI services
-from services.pdf_text import extract_text_from_pdf_path
+# ✅ AI services (IMPORT MODULES, NOT SYMBOLS)
 from services.ai_analyzer import analyze_document_text
+from services import pdf_text
 
 # ---------------- DATABASE ----------------
 from deps import get_db, engine
@@ -42,14 +40,6 @@ from routers.affiliate_admin import router as affiliate_admin_router
 
 app.include_router(affiliate_auth_router)
 app.include_router(affiliate_admin_router)
-
-# (Optional) If you created routers/ai_test.py from earlier step, include it safely:
-try:
-    from routers.ai_test import router as ai_test_router
-    app.include_router(ai_test_router)
-except Exception:
-    # If file doesn't exist yet, don't crash deploy
-    pass
 
 # ---------------- STARTUP ----------------
 @app.on_event("startup")
@@ -119,6 +109,18 @@ def send_reset_email(to_email: str, reset_link: str):
         print("⚠️ Resend failed:", str(e))
         print("🔑 RESET LINK:", reset_link)
 
+def extract_pdf_text(path: str) -> str:
+    """
+    Uses services/pdf_text.py safely without import-name crashes.
+    """
+    try:
+        fn = getattr(pdf_text, "extract_text_from_pdf_path", None)
+        if callable(fn):
+            return fn(path) or ""
+    except Exception:
+        pass
+    return ""
+
 # ---------------- STRIPE ----------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -136,16 +138,16 @@ if STRIPE_SECRET_KEY:
 def health():
     return {"ok": True}
 
-# Quick AI smoke test (works with your existing analyzer)
 @app.get("/ai/test")
 def ai_test():
+    """
+    Quick sanity check that AI analyzer works at runtime.
+    """
     try:
         out = analyze_document_text(
             "This is a test lease. Rent is $1,500 due on the 1st. Late fee is $75 after 5 days."
         )
-        # if analyzer returns huge output, keep response small
-        preview = out[:800] if isinstance(out, str) else str(out)[:800]
-        return {"ok": True, "sample": preview}
+        return {"ok": True, "sample": (out or "")[:500]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -153,7 +155,6 @@ def ai_test():
 class RegisterBody(BaseModel):
     email: EmailStr
     password: str
-    # ✅ Affiliate attribution (optional)
     affiliate_ref_code: str | None = None
 
 class LoginBody(BaseModel):
@@ -282,24 +283,21 @@ def upload_document(
     db.commit()
     db.refresh(doc)
 
-    # ✅ AI ANALYSIS (best effort) — NEVER breaks upload
+    # ✅ AI ANALYSIS (best-effort)
     try:
-        # Extract text
         text = ""
         if (ext or "").lower() == ".pdf":
-            text = extract_text_from_pdf_path(stored_path)
+            text = extract_pdf_text(stored_path)
 
-        # Analyze
         ai_output = analyze_document_text(text)
 
-        # Store
-        doc.review_notes = ai_output if isinstance(ai_output, str) else str(ai_output)
+        doc.review_notes = ai_output
         doc.status = "completed"
         db.commit()
         db.refresh(doc)
 
     except Exception as e:
-        # keep doc uploaded; show placeholder until you retry later
+        # Don't fail the upload if AI fails
         doc.status = "uploaded"
         db.commit()
         print("AI analysis failed:", str(e))
