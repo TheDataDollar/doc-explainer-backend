@@ -1,3 +1,5 @@
+# main.py (FULL COPY / REPLACE)
+
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -9,6 +11,10 @@ import hashlib
 from datetime import datetime, timezone
 import requests
 import stripe
+
+# ✅ AI services
+from services.pdf_text import extract_text_from_pdf_path
+from services.ai_analyzer import analyze_document_text
 
 # ---------------- DATABASE ----------------
 from deps import get_db, engine
@@ -36,6 +42,14 @@ from routers.affiliate_admin import router as affiliate_admin_router
 
 app.include_router(affiliate_auth_router)
 app.include_router(affiliate_admin_router)
+
+# (Optional) If you created routers/ai_test.py from earlier step, include it safely:
+try:
+    from routers.ai_test import router as ai_test_router
+    app.include_router(ai_test_router)
+except Exception:
+    # If file doesn't exist yet, don't crash deploy
+    pass
 
 # ---------------- STARTUP ----------------
 @app.on_event("startup")
@@ -122,6 +136,19 @@ if STRIPE_SECRET_KEY:
 def health():
     return {"ok": True}
 
+# Quick AI smoke test (works with your existing analyzer)
+@app.get("/ai/test")
+def ai_test():
+    try:
+        out = analyze_document_text(
+            "This is a test lease. Rent is $1,500 due on the 1st. Late fee is $75 after 5 days."
+        )
+        # if analyzer returns huge output, keep response small
+        preview = out[:800] if isinstance(out, str) else str(out)[:800]
+        return {"ok": True, "sample": preview}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 # ---------------- AUTH MODELS ----------------
 class RegisterBody(BaseModel):
     email: EmailStr
@@ -156,9 +183,6 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
     # ✅ Attach referral if affiliate_ref_code exists
     ref_code = (body.affiliate_ref_code or "").strip().upper()
     if ref_code:
-        from models_affiliate import AffiliateAccount
-        from models_affiliate_tracking import AffiliateReferral
-
         aff = (
             db.query(AffiliateAccount)
             .filter(AffiliateAccount.ref_code == ref_code)
@@ -258,7 +282,29 @@ def upload_document(
     db.commit()
     db.refresh(doc)
 
-    return {"document_id": doc.id}
+    # ✅ AI ANALYSIS (best effort) — NEVER breaks upload
+    try:
+        # Extract text
+        text = ""
+        if (ext or "").lower() == ".pdf":
+            text = extract_text_from_pdf_path(stored_path)
+
+        # Analyze
+        ai_output = analyze_document_text(text)
+
+        # Store
+        doc.review_notes = ai_output if isinstance(ai_output, str) else str(ai_output)
+        doc.status = "completed"
+        db.commit()
+        db.refresh(doc)
+
+    except Exception as e:
+        # keep doc uploaded; show placeholder until you retry later
+        doc.status = "uploaded"
+        db.commit()
+        print("AI analysis failed:", str(e))
+
+    return {"document_id": doc.id, "status": doc.status}
 
 @app.get("/documents")
 def list_documents(
