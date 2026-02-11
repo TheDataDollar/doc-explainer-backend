@@ -1,3 +1,5 @@
+# routers/affiliate_auth.py (FULL COPY / REPLACE)
+
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -13,7 +15,7 @@ from models_affiliate import AffiliateAccount
 
 router = APIRouter(prefix="/affiliate", tags=["Affiliate"])
 
-# ✅ Use PBKDF2 (stable on Windows) just like your auth_utils direction
+# ✅ Use PBKDF2 (stable on Windows)
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 JWT_SECRET = os.getenv("AFFILIATE_JWT_SECRET") or os.getenv("JWT_SECRET") or "change_me_super_long"
@@ -30,7 +32,6 @@ def verify_password(p: str, hashed: str) -> bool:
 
 
 def generate_ref_code() -> str:
-    # 8 chars, readable
     return secrets.token_hex(4).upper()
 
 
@@ -80,11 +81,7 @@ def register(payload: AffiliateRegisterIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(acc)
 
-    return {
-        "ok": True,
-        "status": acc.status,
-        "message": "Application received. Pending approval.",
-    }
+    return {"ok": True, "status": acc.status, "message": "Application received. Pending approval."}
 
 
 @router.post("/auth/login")
@@ -142,7 +139,6 @@ def me(
         "status": acc.status,
         "ref_code": acc.ref_code,
         "commission_rate": acc.commission_rate,
-        # optional stats placeholders for now
         "clicks": 0,
         "signups": 0,
         "paid_conversions": 0,

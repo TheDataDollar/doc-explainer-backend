@@ -62,10 +62,7 @@ def approve_affiliate(
 
     rate = float(body.commission_rate or 0.30)
     if rate <= 0 or rate > 1:
-        raise HTTPException(
-            status_code=400,
-            detail="commission_rate must be between 0 and 1",
-        )
+        raise HTTPException(status_code=400, detail="commission_rate must be between 0 and 1")
 
     acc.status = "approved"
     acc.commission_rate = rate

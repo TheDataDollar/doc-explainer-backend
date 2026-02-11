@@ -1,6 +1,6 @@
 # main.py (FULL COPY / REPLACE)
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -115,6 +115,12 @@ def send_reset_email(to_email: str, reset_link: str):
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 
+# Read price IDs from env (safe). Your frontend just needs /billing/prices to exist.
+PRO_MONTHLY_PRICE_ID = os.getenv("PRO_MONTHLY_PRICE_ID", "").strip()
+PRO_YEARLY_PRICE_ID = os.getenv("PRO_YEARLY_PRICE_ID", "").strip()
+BUSINESS_MONTHLY_PRICE_ID = os.getenv("BUSINESS_MONTHLY_PRICE_ID", "").strip()
+BUSINESS_YEARLY_PRICE_ID = os.getenv("BUSINESS_YEARLY_PRICE_ID", "").strip()
+
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
@@ -148,6 +154,7 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
         password_hash=hash_password(body.password),
         free_docs_used=0,
         is_paid=False,
+        plan_tier="free",
     )
 
     db.add(user)
@@ -169,6 +176,7 @@ def login(body: LoginBody, db: Session = Depends(get_db)):
         "token": create_access_token(user.id),
         "free_docs_used": user.free_docs_used,
         "is_paid": user.is_paid,
+        "plan_tier": user.plan_tier,
     }
 
 # ---------------- USER ----------------
@@ -182,6 +190,34 @@ def me(current_user: User = Depends(get_current_user)):
         "is_paid": current_user.is_paid,
         "plan_tier": current_user.plan_tier,
     }
+
+# ---------------- BILLING (MINIMUM TO FIX 404s) ----------------
+
+@app.get("/billing/prices")
+def billing_prices():
+    # Even if you haven’t wired Stripe checkout yet, returning these avoids frontend 404s.
+    return {
+        "ok": True,
+        "prices": {
+            "pro": {
+                "monthly": PRO_MONTHLY_PRICE_ID,
+                "yearly": PRO_YEARLY_PRICE_ID,
+            },
+            "business": {
+                "monthly": BUSINESS_MONTHLY_PRICE_ID,
+                "yearly": BUSINESS_YEARLY_PRICE_ID,
+            },
+        },
+    }
+
+# Optional stubs (exist so frontend won’t 404 if you call them later)
+@app.post("/billing/portal")
+def billing_portal():
+    raise HTTPException(status_code=501, detail="Billing portal not wired in this build yet")
+
+@app.post("/billing/webhook")
+async def billing_webhook(_: Request):
+    raise HTTPException(status_code=501, detail="Webhook not wired in this build yet")
 
 # ---------------- DOCUMENTS ----------------
 
@@ -208,6 +244,7 @@ def upload_document(
         original_filename=file.filename or "unknown",
         stored_filename=stored_filename,
         stored_path=stored_path,
+        status="uploaded",
     )
 
     db.add(doc)
@@ -219,6 +256,73 @@ def upload_document(
     db.refresh(doc)
 
     return {"document_id": doc.id}
+
+@app.get("/documents")
+def list_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    docs = (
+        db.query(Document)
+        .filter(Document.user_id == current_user.id)
+        .order_by(Document.id.desc())
+        .all()
+    )
+    return [
+        {
+            "document_id": d.id,
+            "original_filename": d.original_filename,
+            "stored_filename": d.stored_filename,
+            "created_at": d.created_at,
+            "status": d.status,
+        }
+        for d in docs
+    ]
+
+@app.get("/documents/{document_id}")
+def get_document(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    doc = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.user_id == current_user.id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "document_id": doc.id,
+        "original_filename": doc.original_filename,
+        "stored_filename": doc.stored_filename,
+        "stored_path": doc.stored_path,
+        "created_at": doc.created_at,
+        "status": doc.status,
+        "review_notes": doc.review_notes,
+    }
+
+@app.get("/documents/{document_id}/review")
+def get_document_review(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    doc = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.user_id == current_user.id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "document_id": doc.id,
+        "status": doc.status,
+        "review_notes": doc.review_notes,
+        "created_at": doc.created_at,
+    }
 
 # ---------------- ADMIN ----------------
 
