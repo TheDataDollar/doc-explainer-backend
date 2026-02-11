@@ -1,17 +1,24 @@
-# routers/affiliate_auth.py (FULL COPY / REPLACE)
-
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 import secrets
 import time
 import os
+from datetime import datetime
 
 from jose import jwt
 from passlib.context import CryptContext
 
 from deps import get_db
 from models_affiliate import AffiliateAccount
+
+# ✅ tracking models
+from models_affiliate_tracking import (
+    AffiliateClick,
+    AffiliateReferral,
+    AffiliateCommissionLedger,
+)
 
 router = APIRouter(prefix="/affiliate", tags=["Affiliate"])
 
@@ -32,6 +39,7 @@ def verify_password(p: str, hashed: str) -> bool:
 
 
 def generate_ref_code() -> str:
+    # short + readable + unique enforced below
     return secrets.token_hex(4).upper()
 
 
@@ -65,6 +73,7 @@ def register(payload: AffiliateRegisterIn, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    # ✅ auto-generate unique ref code for every affiliate signup
     ref_code = generate_ref_code()
     while db.query(AffiliateAccount).filter(AffiliateAccount.ref_code == ref_code).first():
         ref_code = generate_ref_code()
@@ -121,6 +130,24 @@ def get_current_affiliate_from_token(token: str, db: Session) -> AffiliateAccoun
     return acc
 
 
+# ✅ PUBLIC: track a click for a ref code (no auth needed)
+@router.post("/track-click/{ref_code}")
+def track_click(ref_code: str, db: Session = Depends(get_db)):
+    code = (ref_code or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing ref code")
+
+    acc = db.query(AffiliateAccount).filter(AffiliateAccount.ref_code == code).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Affiliate not found")
+
+    click = AffiliateClick(affiliate_id=acc.id, landing_path="/r/" + code)
+    db.add(click)
+    db.commit()
+
+    return {"ok": True}
+
+
 @router.get("/me")
 def me(
     authorization: str | None = Header(default=None),
@@ -132,6 +159,31 @@ def me(
     token = authorization.split(" ", 1)[1].strip()
     acc = get_current_affiliate_from_token(token, db)
 
+    # ✅ LIVE METRICS (no mock data)
+    clicks = db.query(func.count(AffiliateClick.id)).filter(
+        AffiliateClick.affiliate_id == acc.id
+    ).scalar() or 0
+
+    signups = db.query(func.count(AffiliateReferral.id)).filter(
+        AffiliateReferral.affiliate_id == acc.id
+    ).scalar() or 0
+
+    paid_conversions = db.query(func.count(AffiliateReferral.id)).filter(
+        AffiliateReferral.affiliate_id == acc.id,
+        AffiliateReferral.first_paid_at.isnot(None),
+    ).scalar() or 0
+
+    # ✅ LIVE EARNINGS (from ledger; accurate)
+    now = datetime.utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    earnings_cents = db.query(func.coalesce(func.sum(AffiliateCommissionLedger.amount_cents), 0)).filter(
+        AffiliateCommissionLedger.affiliate_id == acc.id,
+        AffiliateCommissionLedger.created_at >= month_start,
+    ).scalar() or 0
+
+    est_monthly_earnings = float(earnings_cents) / 100.0
+
     return {
         "id": acc.id,
         "email": acc.email,
@@ -139,7 +191,8 @@ def me(
         "status": acc.status,
         "ref_code": acc.ref_code,
         "commission_rate": acc.commission_rate,
-        "clicks": 0,
-        "signups": 0,
-        "paid_conversions": 0,
+        "clicks": clicks,
+        "signups": signups,
+        "paid_conversions": paid_conversions,
+        "est_monthly_earnings": est_monthly_earnings,
     }
