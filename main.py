@@ -1,5 +1,3 @@
-# main.py (FULL COPY / REPLACE)
-
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -13,26 +11,26 @@ import requests
 import stripe
 
 # ---------------- DATABASE ----------------
-
 from deps import get_db, engine
 from db import Base, User, Document, PasswordResetToken
 
-# IMPORTANT: import affiliate model so table is created
+# IMPORTANT: import affiliate models so tables are created
 from models_affiliate import AffiliateAccount  # noqa: F401
+from models_affiliate_tracking import (  # noqa: F401
+    AffiliateClick,
+    AffiliateReferral,
+    AffiliateCommissionLedger,
+)
 
 # ---------------- AUTH ----------------
-
 from auth_deps import get_current_user
 from admin_auth import require_admin
 from auth_utils import hash_password, verify_password, create_access_token
 
 # ---------------- APP ----------------
-
 app = FastAPI(title="Document Explainer API")
 
 # ---------------- ROUTERS ----------------
-# ✅ include routers AFTER app exists
-
 from routers.affiliate_auth import router as affiliate_auth_router
 from routers.affiliate_admin import router as affiliate_admin_router
 
@@ -40,7 +38,6 @@ app.include_router(affiliate_auth_router)
 app.include_router(affiliate_admin_router)
 
 # ---------------- STARTUP ----------------
-
 @app.on_event("startup")
 def on_startup():
     try:
@@ -51,7 +48,6 @@ def on_startup():
         print(e)
 
 # ---------------- CORS ----------------
-
 ENV = os.getenv("ENV", "development").lower()
 
 raw_origins = os.getenv("CORS_ORIGINS", "").strip()
@@ -75,7 +71,6 @@ app.add_middleware(
 )
 
 # ---------------- HELPERS ----------------
-
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://document-explainer-blond.vercel.app")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "Document Explainer <onboarding@resend.dev>")
@@ -111,11 +106,9 @@ def send_reset_email(to_email: str, reset_link: str):
         print("🔑 RESET LINK:", reset_link)
 
 # ---------------- STRIPE ----------------
-
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 
-# Read price IDs from env (safe). Your frontend just needs /billing/prices to exist.
 PRO_MONTHLY_PRICE_ID = os.getenv("PRO_MONTHLY_PRICE_ID", "").strip()
 PRO_YEARLY_PRICE_ID = os.getenv("PRO_YEARLY_PRICE_ID", "").strip()
 BUSINESS_MONTHLY_PRICE_ID = os.getenv("BUSINESS_MONTHLY_PRICE_ID", "").strip()
@@ -125,23 +118,22 @@ if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 # ---------------- HEALTH ----------------
-
 @app.get("/health")
 def health():
     return {"ok": True}
 
 # ---------------- AUTH MODELS ----------------
-
 class RegisterBody(BaseModel):
     email: EmailStr
     password: str
+    # ✅ Affiliate attribution (optional)
+    affiliate_ref_code: str | None = None
 
 class LoginBody(BaseModel):
     email: EmailStr
     password: str
 
 # ---------------- AUTH ROUTES ----------------
-
 @app.post("/auth/register")
 def register(body: RegisterBody, db: Session = Depends(get_db)):
     email = body.email.lower().strip()
@@ -160,6 +152,28 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    # ✅ Attach referral if affiliate_ref_code exists
+    ref_code = (body.affiliate_ref_code or "").strip().upper()
+    if ref_code:
+        from models_affiliate import AffiliateAccount
+        from models_affiliate_tracking import AffiliateReferral
+
+        aff = (
+            db.query(AffiliateAccount)
+            .filter(AffiliateAccount.ref_code == ref_code)
+            .filter(AffiliateAccount.status == "approved")
+            .first()
+        )
+        if aff:
+            existing = (
+                db.query(AffiliateReferral)
+                .filter(AffiliateReferral.referred_user_id == user.id)
+                .first()
+            )
+            if not existing:
+                db.add(AffiliateReferral(affiliate_id=aff.id, referred_user_id=user.id))
+                db.commit()
 
     return {"user_id": user.id, "token": create_access_token(user.id)}
 
@@ -180,7 +194,6 @@ def login(body: LoginBody, db: Session = Depends(get_db)):
     }
 
 # ---------------- USER ----------------
-
 @app.get("/me")
 def me(current_user: User = Depends(get_current_user)):
     return {
@@ -192,25 +205,16 @@ def me(current_user: User = Depends(get_current_user)):
     }
 
 # ---------------- BILLING (MINIMUM TO FIX 404s) ----------------
-
 @app.get("/billing/prices")
 def billing_prices():
-    # Even if you haven’t wired Stripe checkout yet, returning these avoids frontend 404s.
     return {
         "ok": True,
         "prices": {
-            "pro": {
-                "monthly": PRO_MONTHLY_PRICE_ID,
-                "yearly": PRO_YEARLY_PRICE_ID,
-            },
-            "business": {
-                "monthly": BUSINESS_MONTHLY_PRICE_ID,
-                "yearly": BUSINESS_YEARLY_PRICE_ID,
-            },
+            "pro": {"monthly": PRO_MONTHLY_PRICE_ID, "yearly": PRO_YEARLY_PRICE_ID},
+            "business": {"monthly": BUSINESS_MONTHLY_PRICE_ID, "yearly": BUSINESS_YEARLY_PRICE_ID},
         },
     }
 
-# Optional stubs (exist so frontend won’t 404 if you call them later)
 @app.post("/billing/portal")
 def billing_portal():
     raise HTTPException(status_code=501, detail="Billing portal not wired in this build yet")
@@ -220,7 +224,6 @@ async def billing_webhook(_: Request):
     raise HTTPException(status_code=501, detail="Webhook not wired in this build yet")
 
 # ---------------- DOCUMENTS ----------------
-
 @app.post("/documents/upload")
 def upload_document(
     file: UploadFile = File(...),
@@ -325,7 +328,6 @@ def get_document_review(
     }
 
 # ---------------- ADMIN ----------------
-
 @app.get("/admin/users")
 def admin_list_users(
     db: Session = Depends(get_db),

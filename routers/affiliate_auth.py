@@ -12,8 +12,6 @@ from passlib.context import CryptContext
 
 from deps import get_db
 from models_affiliate import AffiliateAccount
-
-# ✅ tracking models
 from models_affiliate_tracking import (
     AffiliateClick,
     AffiliateReferral,
@@ -22,26 +20,20 @@ from models_affiliate_tracking import (
 
 router = APIRouter(prefix="/affiliate", tags=["Affiliate"])
 
-# ✅ Use PBKDF2 (stable on Windows)
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 JWT_SECRET = os.getenv("AFFILIATE_JWT_SECRET") or os.getenv("JWT_SECRET") or "change_me_super_long"
 JWT_ALG = "HS256"
 TOKEN_DAYS = 7
 
-
 def hash_password(p: str) -> str:
     return pwd_context.hash(p.strip())
-
 
 def verify_password(p: str, hashed: str) -> bool:
     return pwd_context.verify(p.strip(), hashed)
 
-
 def generate_ref_code() -> str:
-    # short + readable + unique enforced below
     return secrets.token_hex(4).upper()
-
 
 def create_affiliate_token(affiliate_id: int) -> str:
     now = int(time.time())
@@ -53,17 +45,14 @@ def create_affiliate_token(affiliate_id: int) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-
 class AffiliateRegisterIn(BaseModel):
     email: EmailStr
     password: str
     display_name: str | None = None
 
-
 class AffiliateLoginIn(BaseModel):
     email: EmailStr
     password: str
-
 
 @router.post("/auth/register")
 def register(payload: AffiliateRegisterIn, db: Session = Depends(get_db)):
@@ -73,7 +62,6 @@ def register(payload: AffiliateRegisterIn, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # ✅ auto-generate unique ref code for every affiliate signup
     ref_code = generate_ref_code()
     while db.query(AffiliateAccount).filter(AffiliateAccount.ref_code == ref_code).first():
         ref_code = generate_ref_code()
@@ -92,7 +80,6 @@ def register(payload: AffiliateRegisterIn, db: Session = Depends(get_db)):
 
     return {"ok": True, "status": acc.status, "message": "Application received. Pending approval."}
 
-
 @router.post("/auth/login")
 def login(payload: AffiliateLoginIn, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
@@ -106,7 +93,6 @@ def login(payload: AffiliateLoginIn, db: Session = Depends(get_db)):
 
     token = create_affiliate_token(acc.id)
     return {"access_token": token, "token_type": "bearer"}
-
 
 def get_current_affiliate_from_token(token: str, db: Session) -> AffiliateAccount:
     try:
@@ -129,8 +115,7 @@ def get_current_affiliate_from_token(token: str, db: Session) -> AffiliateAccoun
 
     return acc
 
-
-# ✅ PUBLIC: track a click for a ref code (no auth needed)
+# ✅ PUBLIC click tracking (no auth)
 @router.post("/track-click/{ref_code}")
 def track_click(ref_code: str, db: Session = Depends(get_db)):
     code = (ref_code or "").strip().upper()
@@ -141,12 +126,10 @@ def track_click(ref_code: str, db: Session = Depends(get_db)):
     if not acc:
         raise HTTPException(status_code=404, detail="Affiliate not found")
 
-    click = AffiliateClick(affiliate_id=acc.id, landing_path="/r/" + code)
-    db.add(click)
+    db.add(AffiliateClick(affiliate_id=acc.id, landing_path="/r/" + code))
     db.commit()
 
     return {"ok": True}
-
 
 @router.get("/me")
 def me(
@@ -159,7 +142,6 @@ def me(
     token = authorization.split(" ", 1)[1].strip()
     acc = get_current_affiliate_from_token(token, db)
 
-    # ✅ LIVE METRICS (no mock data)
     clicks = db.query(func.count(AffiliateClick.id)).filter(
         AffiliateClick.affiliate_id == acc.id
     ).scalar() or 0
@@ -173,7 +155,7 @@ def me(
         AffiliateReferral.first_paid_at.isnot(None),
     ).scalar() or 0
 
-    # ✅ LIVE EARNINGS (from ledger; accurate)
+    # earnings this month (ledger-based)
     now = datetime.utcnow()
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
