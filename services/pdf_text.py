@@ -4,23 +4,24 @@ import os
 
 def extract_text_from_pdf_path(pdf_path: str) -> str:
     """
-    Baby-simple PDF text extraction with OCR fallback.
-    Input: path to a PDF on disk
-    Output: best-effort plain text
+    Best-effort PDF text extraction:
+    1) pdfplumber (text PDFs)
+    2) PyPDF2 (fallback)
+    3) OCR fallback (scanned PDFs) using pdf2image + pytesseract
+       (requires system deps on server: tesseract + poppler)
     """
     if not pdf_path or not os.path.exists(pdf_path):
         return ""
 
-    # -----------------------
-    # Option A (best): pdfplumber
-    # -----------------------
+    # ---------- A) pdfplumber ----------
     try:
-        import pdfplumber  # pip install pdfplumber
+        import pdfplumber
         chunks: list[str] = []
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 t = page.extract_text() or ""
-                if t.strip():
+                t = t.strip()
+                if t:
                     chunks.append(t)
         text = "\n\n".join(chunks).strip()
         if text:
@@ -28,16 +29,15 @@ def extract_text_from_pdf_path(pdf_path: str) -> str:
     except Exception:
         pass
 
-    # -----------------------
-    # Option B: PyPDF2 fallback
-    # -----------------------
+    # ---------- B) PyPDF2 ----------
     try:
-        from PyPDF2 import PdfReader  # pip install PyPDF2
+        from PyPDF2 import PdfReader
         reader = PdfReader(pdf_path)
         chunks: list[str] = []
         for page in reader.pages:
             t = page.extract_text() or ""
-            if t.strip():
+            t = t.strip()
+            if t:
                 chunks.append(t)
         text = "\n\n".join(chunks).strip()
         if text:
@@ -45,34 +45,23 @@ def extract_text_from_pdf_path(pdf_path: str) -> str:
     except Exception:
         pass
 
-    # -----------------------
-    # Option C: OCR fallback (scanned/image PDFs)
-    # Uses pypdfium2 to render pages -> pytesseract to read text
-    # -----------------------
+    # ---------- C) OCR fallback ----------
     try:
-        import pytesseract  # pip install pytesseract
-        import pypdfium2 as pdfium  # already in your env earlier
-        from PIL import Image  # pillow is already in your env
+        # Converts PDF pages -> images, then OCR images -> text
+        from pdf2image import convert_from_path
+        import pytesseract
 
-        doc = pdfium.PdfDocument(pdf_path)
-        out: list[str] = []
+        # Convert first N pages to keep costs controlled
+        MAX_PAGES = 12
+        images = convert_from_path(pdf_path, dpi=250, first_page=1, last_page=MAX_PAGES)
 
-        # Render a limited number of pages if you want (uncomment to limit)
-        # max_pages = min(len(doc), 15)
-        # page_range = range(max_pages)
+        ocr_chunks: list[str] = []
+        for img in images:
+            t = pytesseract.image_to_string(img) or ""
+            t = t.strip()
+            if t:
+                ocr_chunks.append(t)
 
-        page_range = range(len(doc))
-
-        for i in page_range:
-            page = doc[i]
-            # 2.0 scale = clearer OCR without being insane
-            bitmap = page.render(scale=2.0)
-            pil_image: Image.Image = bitmap.to_pil()
-
-            txt = pytesseract.image_to_string(pil_image, lang="eng") or ""
-            if txt.strip():
-                out.append(txt.strip())
-
-        return "\n\n".join(out).strip()
+        return "\n\n".join(ocr_chunks).strip()
     except Exception:
         return ""
