@@ -112,14 +112,24 @@ def send_reset_email(to_email: str, reset_link: str):
 def extract_pdf_text(path: str) -> str:
     """
     Uses services/pdf_text.py safely without import-name crashes.
+    Returns best-effort text (includes OCR fallback if you added it).
     """
     try:
         fn = getattr(pdf_text, "extract_text_from_pdf_path", None)
         if callable(fn):
             return fn(path) or ""
-    except Exception:
-        pass
+    except Exception as e:
+        print("PDF text extraction failed:", str(e))
     return ""
+
+def clamp_text(s: str, limit: int = 120_000) -> str:
+    """
+    Prevent crazy-long PDFs from blowing up your token usage.
+    """
+    if not s:
+        return ""
+    s = s.strip()
+    return s[:limit]
 
 # ---------------- STRIPE ----------------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
@@ -273,6 +283,7 @@ def upload_document(
         stored_filename=stored_filename,
         stored_path=stored_path,
         status="uploaded",
+        review_notes=None,
     )
 
     db.add(doc)
@@ -288,10 +299,21 @@ def upload_document(
         text = ""
         if (ext or "").lower() == ".pdf":
             text = extract_pdf_text(stored_path)
+        text = clamp_text(text)
+
+        if not text.strip():
+            doc.review_notes = (
+                "No readable text was found in this document.\n\n"
+                "If this is a scanned PDF, enable OCR (tesseract) on the server "
+                "or upload a text-based PDF.\n"
+            )
+            doc.status = "completed"
+            db.commit()
+            return {"document_id": doc.id, "status": doc.status}
 
         ai_output = analyze_document_text(text)
 
-        doc.review_notes = ai_output
+        doc.review_notes = ai_output or ""
         doc.status = "completed"
         db.commit()
         db.refresh(doc)
@@ -347,7 +369,7 @@ def get_document(
         "stored_path": doc.stored_path,
         "created_at": doc.created_at,
         "status": doc.status,
-        "review_notes": doc.review_notes,
+        "review_notes": doc.review_notes or "",
     }
 
 @app.get("/documents/{document_id}/review")
@@ -356,6 +378,10 @@ def get_document_review(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """
+    Frontend-friendly endpoint:
+    returns only what the UI needs to render the analysis.
+    """
     doc = (
         db.query(Document)
         .filter(Document.id == document_id, Document.user_id == current_user.id)
@@ -367,7 +393,7 @@ def get_document_review(
     return {
         "document_id": doc.id,
         "status": doc.status,
-        "review_notes": doc.review_notes,
+        "review_notes": doc.review_notes or "",
         "created_at": doc.created_at,
     }
 
